@@ -3,7 +3,6 @@ const router = express.Router();
 const { sendDiscordMessage, createEmbed, COLORS } = require('../utils/discord');
 const axios = require('axios');
 
-// Abbreviate long Typeform question titles
 function abbreviateTitle(title) {
   const map = {
     'are you a permanent resident of the uk or us': 'Permanent Resident?',
@@ -16,8 +15,8 @@ function abbreviateTitle(title) {
     'how soon are you looking to make this transition': 'Timeline',
     'the investment for our program is': 'Investment',
     'to be approved for a 12-month payment plan': 'Credit Score',
-    'now, book your tech sales career coaching call': 'Call Booking 1',
-    'schedule your tech sales career coaching call below': 'Call Booking 2',
+    'now, book your tech sales career coaching call': 'UQ Calendar Booking',
+    'schedule your tech sales career coaching call below': 'Main Calendar Booking',
     'how did you hear about entr tech': 'Source',
     'first name': 'First Name',
     'last name': 'Last Name',
@@ -62,14 +61,19 @@ router.post('/webhook', async (req, res) => {
 
     const discordFields = [];
     let isQualified = false;
+    let isPremiumLead = false;
     let hasCalendly = false;
+    let bookedUQCalendar = false;
+    let isEligibleForGHL = true;
 
-    // Extract contact info
     let firstName = '';
     let lastName = '';
     let phone = '';
     let email = '';
     let source = '';
+    let creditScore = '';
+    let income = '';
+    let isResident = '';
 
     const now = new Date().toLocaleDateString('en-GB');
     discordFields.push({ name: 'Time', value: now, inline: true });
@@ -107,36 +111,76 @@ router.post('/webhook', async (req, res) => {
         case 'calendly':
           hasCalendly = true;
           value = answer.url || 'Call Booked ✅';
+          if (value.toLowerCase().includes('uq')) {
+            bookedUQCalendar = true;
+          }
           break;
         case 'url':
           value = answer.url || '';
           if (value.includes('calendly.com') && value.includes('invitees')) {
             hasCalendly = true;
+            if (value.toLowerCase().includes('uq')) {
+              bookedUQCalendar = true;
+            }
           }
           break;
         default:
           value = answer.url || answer.text || answer.email || '';
           if (value && value.includes('calendly.com') && value.includes('invitees')) {
             hasCalendly = true;
+            if (value.toLowerCase().includes('uq')) {
+              bookedUQCalendar = true;
+            }
           }
       }
 
-      // Extract name fields
       const titleLower = rawTitle.toLowerCase();
       if (titleLower.includes('first name')) firstName = value;
       if (titleLower.includes('last name')) lastName = value;
       if (titleLower.includes('how did you hear')) source = value;
+      if (titleLower.includes('permanent resident')) isResident = value;
+      if (titleLower.includes('earning') || titleLower.includes('income')) income = value;
 
-      // Qualifying logic
-      if (
-        titleLower.includes('invest') ||
-        titleLower.includes('£3500') ||
-        titleLower.includes('payment plan')
-      ) {
+      // Qualifying logic - investment question
+      if (titleLower.includes('invest') || titleLower.includes('£3500') || titleLower.includes('payment plan')) {
         const valueLower = value.toLowerCase();
         if (valueLower.includes('yes') || valueLower.includes('can invest')) {
           isQualified = true;
         }
+      }
+
+      // Credit score check for premium leads
+      if (titleLower.includes('credit score') || titleLower.includes('experian')) {
+        creditScore = value;
+        const scoreLower = value.toLowerCase();
+        if (
+          scoreLower.includes('800') ||
+          scoreLower.includes('701') ||
+          scoreLower.includes('600 - 700') ||
+          scoreLower.includes('600')
+        ) {
+          if (isQualified) isPremiumLead = true;
+        }
+      }
+
+      // GHL eligibility check
+      if (titleLower.includes('permanent resident')) {
+        if (value.toLowerCase() === 'no') isEligibleForGHL = false;
+      }
+      if (titleLower.includes('earning') || titleLower.includes('income')) {
+        if (value.toLowerCase().includes('unemployed')) isEligibleForGHL = false;
+      }
+
+      // Skip calendar booking fields from Discord - they're long URLs
+      if (fieldTitle === 'UQ Calendar Booking' || fieldTitle === 'Main Calendar Booking') {
+        if (value) {
+          discordFields.push({
+            name: fieldTitle.substring(0, 256),
+            value: String(value).substring(0, 1024),
+            inline: true
+          });
+        }
+        return;
       }
 
       if (value) {
@@ -173,26 +217,38 @@ router.post('/webhook', async (req, res) => {
     }
 
     if (hasCalendly) {
-      const color = isQualified ? COLORS.GREEN : COLORS.BLUE;
-      const title = isQualified
-        ? '📞 New Call Booked - QUALIFIED'
-        : '📞 New Call Booked - UNQUALIFIED';
+      // Determine colour based on lead quality
+      let color, title;
+
+      if (isPremiumLead && !bookedUQCalendar) {
+        // Gold - best leads: qualified + 600+ credit score + main calendar
+        color = COLORS.GOLD;
+        title = '🥇 New Call Booked - PREMIUM QUALIFIED';
+      } else if (isQualified) {
+        // Green - qualified but UQ calendar or lower credit score
+        color = COLORS.GREEN;
+        title = '📞 New Call Booked - QUALIFIED';
+      } else {
+        // Blue - unqualified
+        color = COLORS.BLUE;
+        title = '📞 New Call Booked - UNQUALIFIED';
+      }
+
       const embed = createEmbed(title, discordFields, color);
       await sendDiscordMessage(process.env.DISCORD_WEBHOOK_BOOKED_CALLS, embed);
-    } else {
-      // Create contact in GHL
-      const contactData = {
-        firstName,
-        lastName,
-        email,
-        phone,
-        locationId: process.env.GHL_LOCATION_ID,
-        source: source || 'Typeform',
-        tags: ['typeform-lead'],
-        customField: {}
-      };
 
-      if (firstName || email || phone) {
+    } else {
+      // New lead - only create GHL contact if eligible
+      if (isEligibleForGHL && (firstName || email || phone)) {
+        const contactData = {
+          firstName,
+          lastName,
+          email,
+          phone,
+          locationId: process.env.GHL_LOCATION_ID,
+          source: source || 'Typeform',
+          tags: ['typeform-lead'],
+        };
         await createGHLContact(contactData);
       }
 
